@@ -4,6 +4,7 @@
 # 3) 把价差画成曲线，方便观察是否有规律
 
 import argparse
+import json
 import logging
 import os
 import time
@@ -14,11 +15,14 @@ from ccxt.base.errors import ExchangeError, NetworkError, RequestTimeout
 import matplotlib.pyplot as plt
 import pandas as pd
 
-# 默认代理：在受限网络环境下，默认就走本地代理。
-# 你也可以通过环境变量 BITGET_PROXY 覆盖它。
-DEFAULT_PROXY = os.getenv("BITGET_PROXY", "http://127.0.0.1:7890")
+# 默认直连；只有显式传入 --proxy 才启用代理。
+DEFAULT_PROXY = ""
 DEFAULT_TIMEFRAME = "1h"
 DEFAULT_LIMIT = 500
+LOOP_RESULTS_DIR = "results"
+LOOP_PLOT_FILENAME = "spreads_latest.png"
+DEFAULT_ALERT_CONFIG = ""
+SPREAD_COLUMNS = ["XAU_minus_XAUT", "XAU_minus_PAXG", "PAXG_minus_XAUT"]
 
 # 这里定义我们要分析的 3 个交易对：
 # key 是我们自己的简称，value 是 ccxt 识别的标准 symbol
@@ -59,16 +63,28 @@ def parse_args() -> argparse.Namespace:
     # 每次重试前等待多久（秒）
     parser.add_argument("--retry-delay", type=float, default=2.0, help="Seconds to wait between retries")
 
-    # 代理地址。优先级：命令行 --proxy > 环境变量 BITGET_PROXY > 默认 127.0.0.1:7890
-    # 如果你临时不想使用代理，可以传：--proxy ""
+    # 代理地址。默认直连，只有显式传入 --proxy 才启用代理。
     parser.add_argument(
         "--proxy",
         default=DEFAULT_PROXY,
-        help="HTTP(S) proxy URL. Default: http://127.0.0.1:7890",
+        help="HTTP(S) proxy URL. Default: direct connection (no proxy).",
     )
 
-    # 如果不想弹出图表窗口，可以加 --no-plot
-    parser.add_argument("--no-plot", action="store_true", help="Do not show matplotlib chart")
+    # 如果不想弹出图表窗口，可以加 --no-plot（仅单次模式）
+    parser.add_argument("--no-plot", action="store_true", help="Do not show matplotlib chart in single-run mode")
+    parser.add_argument(
+        "--loop",
+        dest="loop",
+        action="store_true",
+        help="Run continuously (every 60 seconds)",
+    )
+    parser.add_argument(
+        "--alert-config",
+        default=DEFAULT_ALERT_CONFIG,
+        help="Alert config JSON path. Alerts are disabled unless this is provided.",
+    )
+    # 兼容旧参数名，帮助信息中隐藏
+    parser.add_argument("--every-60s", dest="loop", action="store_true", help=argparse.SUPPRESS)
 
     return parser.parse_args()
 
@@ -92,6 +108,10 @@ def create_exchange(timeout_ms: int, proxy: str) -> ccxt.bitget:
         config["proxies"] = {"http": proxy, "https": proxy}
 
     exchange = ccxt.bitget(config)
+    session = getattr(exchange, "session", None)
+    if session is not None:
+        # Ignore HTTP(S)_PROXY env vars; only allow proxy from --proxy.
+        session.trust_env = False
 
     # 双保险：不同版本 ccxt 对该选项的读取路径可能不同。
     # 显式设置可以最大限度避免 load_markets 时请求 currencies 接口。
@@ -240,8 +260,87 @@ def add_spreads(price_df: pd.DataFrame) -> pd.DataFrame:
     return price_df
 
 
-# 绘制价差曲线
-def plot_spreads(price_df: pd.DataFrame) -> None:
+def load_alert_config(config_path: str) -> dict:
+    if not os.path.exists(config_path):
+        logging.warning("Alert config not found: %s (alerts disabled)", config_path)
+        return {"enabled": False, "use_absolute": True, "thresholds": {}}
+
+    with open(config_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    if not isinstance(data, dict):
+        raise ValueError("Alert config must be a JSON object")
+
+    enabled = bool(data.get("enabled", True))
+    use_absolute = bool(data.get("use_absolute", True))
+    raw_thresholds = data.get("thresholds", {})
+    if not isinstance(raw_thresholds, dict):
+        raise ValueError("'thresholds' in alert config must be a JSON object")
+
+    thresholds = {}
+    for spread_name in SPREAD_COLUMNS:
+        value = raw_thresholds.get(spread_name)
+        if value is None:
+            continue
+        threshold = float(value)
+        if threshold <= 0:
+            raise ValueError(f"Threshold for {spread_name} must be > 0")
+        thresholds[spread_name] = threshold
+
+    if enabled and not thresholds:
+        logging.warning("Alert config loaded but no valid thresholds set (alerts disabled)")
+        enabled = False
+
+    return {"enabled": enabled, "use_absolute": use_absolute, "thresholds": thresholds}
+
+
+def check_alerts(price_df: pd.DataFrame, alert_config: dict) -> None:
+    if not alert_config.get("enabled"):
+        return
+
+    latest = price_df.tail(1).iloc[0]
+    latest_ts = price_df.index[-1]
+    use_absolute = bool(alert_config.get("use_absolute", True))
+    thresholds = alert_config.get("thresholds", {})
+
+    for spread_name, threshold in thresholds.items():
+        value = float(latest[spread_name])
+        measured = abs(value) if use_absolute else value
+        if measured > threshold:
+            if use_absolute:
+                logging.warning(
+                    "ALERT %s | %s=%.6f | abs=%.6f > threshold=%.6f",
+                    latest_ts,
+                    spread_name,
+                    value,
+                    measured,
+                    threshold,
+                )
+            else:
+                logging.warning(
+                    "ALERT %s | %s=%.6f > threshold=%.6f",
+                    latest_ts,
+                    spread_name,
+                    value,
+                    threshold,
+                )
+
+
+# 执行一次完整的数据拉取和计算流程
+def run_once(exchange: ccxt.bitget, args: argparse.Namespace) -> pd.DataFrame:
+    price_df = build_price_df(
+        exchange=exchange,
+        symbols=DEFAULT_SYMBOLS,
+        timeframe=args.timeframe,
+        limit=args.limit,
+        retries=args.retries,
+        retry_delay=args.retry_delay,
+    )
+    return add_spreads(price_df)
+
+
+# 构造价差图（供“显示”和“保存”复用）
+def build_spread_figure(price_df: pd.DataFrame) -> None:
     plt.figure(figsize=(14, 8))
 
     # 每条线表示一组价差
@@ -258,7 +357,19 @@ def plot_spreads(price_df: pd.DataFrame) -> None:
     plt.legend()
     plt.grid(True)
     plt.tight_layout()
+
+
+# 绘制价差曲线
+def plot_spreads(price_df: pd.DataFrame) -> None:
+    build_spread_figure(price_df)
     plt.show()
+
+
+# 保存价差曲线到文件（覆盖保存）
+def save_spreads(price_df: pd.DataFrame, output_path: str) -> None:
+    build_spread_figure(price_df)
+    plt.savefig(output_path, dpi=150)
+    plt.close()
 
 
 # 主流程函数：串起“解析参数 -> 拉数据 -> 算价差 -> 画图”
@@ -273,6 +384,16 @@ def main() -> int:
 
     logging.info("Program running")
     logging.info("timeframe=%s limit=%s", args.timeframe, args.limit)
+    if args.alert_config:
+        alert_config = load_alert_config(args.alert_config)
+    else:
+        alert_config = {"enabled": False, "use_absolute": True, "thresholds": {}}
+    logging.info("alert_config=%s enabled=%s", args.alert_config or "(none)", alert_config["enabled"])
+    if args.loop:
+        logging.info("continuous mode enabled: run every 60 seconds")
+        os.makedirs(LOOP_RESULTS_DIR, exist_ok=True)
+        loop_plot_path = os.path.join(LOOP_RESULTS_DIR, LOOP_PLOT_FILENAME)
+        logging.info("loop chart output: %s (overwrite each run)", loop_plot_path)
 
     # 创建交易所对象
     exchange = create_exchange(timeout_ms=args.timeout_ms, proxy=args.proxy)
@@ -281,24 +402,31 @@ def main() -> int:
     load_markets_with_retry(exchange, retries=args.retries, retry_delay=args.retry_delay)
     validate_symbols(exchange, DEFAULT_SYMBOLS)
 
-    # 拉取价格并计算价差
-    price_df = build_price_df(
-        exchange=exchange,
-        symbols=DEFAULT_SYMBOLS,
-        timeframe=args.timeframe,
-        limit=args.limit,
-        retries=args.retries,
-        retry_delay=args.retry_delay,
-    )
-    price_df = add_spreads(price_df)
+    if args.loop:
+        while True:
+            try:
+                price_df = run_once(exchange, args)
+                logging.info("Fetched %d aligned rows", len(price_df))
+                logging.info("Latest row:\n%s", price_df.tail(1).to_string())
+                check_alerts(price_df, alert_config)
+                save_spreads(price_df, loop_plot_path)
+                logging.info("Saved chart: %s", loop_plot_path)
+            except Exception as err:
+                # 持续模式下单轮失败不退出，等待下一轮继续
+                logging.exception("Iteration failed: %s", err)
+            time.sleep(60)
+    else:
+        # 拉取价格并计算价差
+        price_df = run_once(exchange, args)
 
-    # 打印一些结果，让你不画图也能看到数据
-    logging.info("Fetched %d aligned rows", len(price_df))
-    logging.info("Latest row:\n%s", price_df.tail(1).to_string())
+        # 打印一些结果，让你不画图也能看到数据
+        logging.info("Fetched %d aligned rows", len(price_df))
+        logging.info("Latest row:\n%s", price_df.tail(1).to_string())
+        check_alerts(price_df, alert_config)
 
-    # 默认画图；传 --no-plot 则跳过
-    if not args.no_plot:
-        plot_spreads(price_df)
+        # 默认画图；传 --no-plot 则跳过
+        if not args.no_plot:
+            plot_spreads(price_df)
 
     return 0
 
@@ -308,6 +436,9 @@ def main() -> int:
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
+    except KeyboardInterrupt:
+        logging.info("Stopped by user (Ctrl+C)")
+        raise SystemExit(0)
     except Exception as err:
         # 捕获未处理异常并打印堆栈日志
         logging.exception("Fatal error: %s", err)
